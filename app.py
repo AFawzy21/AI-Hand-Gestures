@@ -1,265 +1,541 @@
+import os
+
+# Silence MSMF's noisy "can't grab frame" warnings and prefer the more
+# stable DirectShow backend on Windows. Must be set before importing cv2.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
+
 import streamlit as st
 import cv2
 import time
-import numpy as np
+import threading
+
+# Extra safety: mute OpenCV's internal logger if the API is available.
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
 
 from Model.MediapipeModel import get_landmarks, flatten_landmarks
 from Model.SvmModel import predict_svc
 
-# ---------- Page config ----------
-st.set_page_config(layout="centered", initial_sidebar_state="collapsed")
-st.markdown("""<style>html{scroll-behavior:auto!important}body{overflow-y:auto!important}</style>""", unsafe_allow_html=True)
-st.title("🎮 Gesture Order System")
-# Gesture legend (static, shown below title)
-st.markdown("""
----
-**Gesture Legend**  
-👍 Next &nbsp;|&nbsp; 👎 Previous &nbsp;|&nbsp; ☝️ Accept &nbsp;|&nbsp; 🖐️ Back &nbsp;|&nbsp; ✊ Idle
-""")
+# ============================================================
+#  Page config & global styles
+# ============================================================
+st.set_page_config(page_title="Gesture Order System", page_icon="🎮", layout="wide")
 
-# ---------- Constants ----------
+st.markdown(
+    """
+    <style>
+        /* Collapse Streamlit's default top/bottom padding so everything fits one screen */
+        .block-container { padding-top: 1.2rem !important; padding-bottom: 0.5rem !important; max-width: 100% !important; }
+        header[data-testid="stHeader"] { height: 0; }
+        #MainMenu, footer { visibility: hidden; }
+
+        .stButton > button {
+            width: 100%;
+            height: 56px;
+            font-size: 17px;
+            font-weight: 600;
+            border-radius: 12px;
+        }
+        .gesture-badge {
+            display:inline-block; padding:2px 10px; margin:2px;
+            border-radius:20px; background:#262730; font-size:13px;
+        }
+        .stage-card {
+            background:#1e1e26; border:1px solid #333; border-radius:14px;
+            padding:14px 20px; text-align:center; margin-bottom:10px;
+        }
+        .stage-title { color:#9aa0ff; font-size:13px; letter-spacing:2px; }
+        .stage-main  { font-size:28px; font-weight:700; margin:4px 0; }
+        .stage-hint  { color:#888; font-size:14px; }
+        /* Keep the camera image from growing taller than the viewport */
+        div[data-testid="stImage"] img { max-height: 62vh; object-fit: contain; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================================================
+#  Constants
+# ============================================================
 CATEGORIES = {
     "Games": ["Fortnite", "Minecraft", "FIFA", "Call of Duty", "Elden Ring"],
-    "Food": ["Pizza", "Burger", "Salad","Pasta"],
+    "Food": ["Pizza", "Burger", "Salad", "Pasta"],
     "Animals": ["Dog", "Cat", "Lion", "Elephant", "Penguin"],
-    "Vehicles": ["Car", "Bike", "Plane", "Ship", "Train"]
+    "Vehicles": ["Car", "Bike", "Plane", "Ship", "Train"],
 }
 MAIN_MENU = ["Buy", "Remove from Stack", "Accept Order", "Cancel Order"]
 REORDER_MENU = ["New Order", "Continue Shopping"]
 
-# ---------- Helper functions ----------
+# Gesture -> icon used both in the legend and on the buttons
+GESTURE_ICONS = {
+    "Next": "👍",
+    "Previous": "👎",
+    "Accept": "☝️",
+    "Back": "🖐️",
+    "Idle": "✊",
+}
+
+DETECTION_INTERVAL = 1.0  # seconds between gesture predictions
+
+
 def get_categories():
     return list(CATEGORIES.keys())
+
 
 def get_items(category):
     return CATEGORIES.get(category, [])
 
-# ---------- State variables (plain Python) ----------
-stage = 'main_menu'
-menu_idx = 0
-cat_idx = 0
-item_idx = 0
-selected_category = None
-order_items = []          # plain list – no session state!
-remove_idx = 0
-last_gesture = None
 
-# ---------- Gesture handler ----------
+# ============================================================
+#  Session state initialisation
+# ============================================================
+def init_state():
+    defaults = {
+        "stage": "main_menu",
+        "menu_idx": 0,
+        "cat_idx": 0,
+        "item_idx": 0,
+        "selected_category": None,
+        "order_items": [],
+        "remove_idx": 0,
+        "camera_on": False,
+        "last_status": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+init_state()
+
+
+# ============================================================
+#  Gesture / action handler  (shared by mouse + camera)
+# ============================================================
 def process_gesture(gesture):
-    global stage, menu_idx, cat_idx, item_idx, selected_category, order_items, remove_idx, last_gesture
+    """Apply an action. `gesture` is one of Next/Previous/Accept/Back."""
+    s = st.session_state
+    stage = s.stage
 
-    # Main menu
-    if stage == 'main_menu':
+    if stage == "main_menu":
         if gesture == "Next":
-            menu_idx = (menu_idx + 1) % len(MAIN_MENU)
+            s.menu_idx = (s.menu_idx + 1) % len(MAIN_MENU)
         elif gesture == "Previous":
-            menu_idx = (menu_idx - 1) % len(MAIN_MENU)
+            s.menu_idx = (s.menu_idx - 1) % len(MAIN_MENU)
         elif gesture == "Accept":
-            choice = MAIN_MENU[menu_idx]
+            choice = MAIN_MENU[s.menu_idx]
             if choice == "Buy":
-                stage = 'selecting_category'
-                cat_idx = 0
+                s.stage = "selecting_category"
+                s.cat_idx = 0
             elif choice == "Remove from Stack":
-                stage = 'remove_from_stack'
-                remove_idx = 0
+                s.stage = "remove_from_stack"
+                s.remove_idx = 0
             elif choice == "Accept Order":
-                stage = 'order_summary'
+                s.stage = "order_summary"
             elif choice == "Cancel Order":
-                order_items.clear()
-                menu_idx = 0
-        last_gesture = None
+                s.order_items = []
+                s.menu_idx = 0
+                s.last_status = "Order cancelled."
 
-    # Selecting category
-    elif stage == 'selecting_category':
+    elif stage == "selecting_category":
         cats = get_categories()
         if gesture == "Next":
-            cat_idx = (cat_idx + 1) % len(cats)
+            s.cat_idx = (s.cat_idx + 1) % len(cats)
         elif gesture == "Previous":
-            cat_idx = (cat_idx - 1) % len(cats)
+            s.cat_idx = (s.cat_idx - 1) % len(cats)
         elif gesture == "Accept":
-            selected_category = cats[cat_idx]
-            stage = 'selecting_item'
-            item_idx = 0
+            s.selected_category = cats[s.cat_idx]
+            s.stage = "selecting_item"
+            s.item_idx = 0
         elif gesture == "Back":
-            stage = 'main_menu'
-        last_gesture = None
+            s.stage = "main_menu"
 
-    # Selecting item
-    elif stage == 'selecting_item':
-        items = get_items(selected_category)
+    elif stage == "selecting_item":
+        items = get_items(s.selected_category)
         if gesture == "Next":
-            item_idx = (item_idx + 1) % len(items)
+            s.item_idx = (s.item_idx + 1) % len(items)
         elif gesture == "Previous":
-            item_idx = (item_idx - 1) % len(items)
+            s.item_idx = (s.item_idx - 1) % len(items)
         elif gesture == "Accept":
-            order_items.append(f"{items[item_idx]} ({selected_category})")
+            s.order_items.append(f"{items[s.item_idx]} ({s.selected_category})")
+            s.last_status = f"Added {items[s.item_idx]} to cart."
         elif gesture == "Back":
-            stage = 'selecting_category'
-        last_gesture = None
+            s.stage = "selecting_category"
 
-    # Removing item
-    elif stage == 'remove_from_stack':
-        if not order_items:
+    elif stage == "remove_from_stack":
+        if not s.order_items:
             if gesture == "Back":
-                stage = 'main_menu'
-                last_gesture = None
+                s.stage = "main_menu"
             return
-
         if gesture == "Next":
-            remove_idx = (remove_idx + 1) % len(order_items)
+            s.remove_idx = (s.remove_idx + 1) % len(s.order_items)
         elif gesture == "Previous":
-            remove_idx = (remove_idx - 1) % len(order_items)
+            s.remove_idx = (s.remove_idx - 1) % len(s.order_items)
         elif gesture == "Accept":
-            order_items.pop(remove_idx)
-            if not order_items:
-                stage = 'main_menu'
+            removed = s.order_items.pop(s.remove_idx)
+            s.last_status = f"Removed {removed}."
+            if not s.order_items:
+                s.stage = "main_menu"
             else:
-                remove_idx = 0
+                s.remove_idx = 0
         elif gesture == "Back":
-            stage = 'main_menu'
-        last_gesture = None
+            s.stage = "main_menu"
 
-    # Order summary
-    elif stage == 'order_summary':
+    elif stage == "order_summary":
         if gesture == "Accept":
-            stage = 'reorder_menu'
-            menu_idx = 0
+            s.stage = "reorder_menu"
+            s.menu_idx = 0
         elif gesture == "Back":
-            stage = 'main_menu'
-        last_gesture = None
+            s.stage = "main_menu"
 
-    # Reorder menu
-    elif stage == 'reorder_menu':
+    elif stage == "reorder_menu":
         if gesture == "Next":
-            menu_idx = (menu_idx + 1) % len(REORDER_MENU)
+            s.menu_idx = (s.menu_idx + 1) % len(REORDER_MENU)
         elif gesture == "Previous":
-            menu_idx = (menu_idx - 1) % len(REORDER_MENU)
+            s.menu_idx = (s.menu_idx - 1) % len(REORDER_MENU)
         elif gesture == "Accept":
-            if REORDER_MENU[menu_idx] == "New Order":
-                order_items.clear()
-                stage = 'main_menu'
-                menu_idx = 0
-                cat_idx = 0
-                item_idx = 0
-                selected_category = None
-                remove_idx = 0
+            if REORDER_MENU[s.menu_idx] == "New Order":
+                s.order_items = []
+                s.stage = "main_menu"
+                s.menu_idx = 0
+                s.cat_idx = 0
+                s.item_idx = 0
+                s.selected_category = None
+                s.remove_idx = 0
+                s.last_status = "Started a new order."
             else:  # Continue Shopping
-                stage = 'selecting_category'
-                cat_idx = 0
-                item_idx = 0
-        last_gesture = None
+                s.stage = "selecting_category"
+                s.cat_idx = 0
+                s.item_idx = 0
 
-# ---------- UI Layout ----------
-col1, col2 = st.columns([3, 1])
-with col1:
-    frame_placeholder = st.empty()
-with col2:
-    info_placeholder = st.empty()   # single placeholder for the whole info panel
 
-# ---------- Camera ----------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    st.error("Cannot access camera!")
-    st.stop()
+# ============================================================
+#  Stage description helpers
+# ============================================================
+def current_view():
+    """Return (title, main_text, hint) for the active stage."""
+    s = st.session_state
+    stage = s.stage
 
-last_detection = time.time()
-DETECTION_INTERVAL = 2.0
-
-# Cached info string to avoid blinking
-last_info_html = ""
-
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # ---------- Build info as a single markdown string ----------
-    stage_text = main_text = hint_text = ""
-
-    if stage == 'main_menu':
-        stage_text = "MAIN MENU"
-        main_text = MAIN_MENU[menu_idx]
-        hint_text = f"({menu_idx+1}/{len(MAIN_MENU)})"
-    elif stage == 'selecting_category':
+    if stage == "main_menu":
+        return "MAIN MENU", MAIN_MENU[s.menu_idx], f"{s.menu_idx + 1}/{len(MAIN_MENU)}"
+    if stage == "selecting_category":
         cats = get_categories()
-        stage_text = "SELECT CATEGORY"
-        main_text = cats[cat_idx]
-        hint_text = f"({cat_idx+1}/{len(cats)})"
-    elif stage == 'selecting_item':
-        items = get_items(selected_category)
-        stage_text = f"SELECT ITEM ({selected_category})"
-        main_text = items[item_idx]
-        hint_text = f"({item_idx+1}/{len(items)})"
-    elif stage == 'remove_from_stack':
-        stage_text = "REMOVE ITEM"
-        if order_items:
-            main_text = order_items[remove_idx]
-            hint_text = f"({remove_idx+1}/{len(order_items)})"
-        else:
-            main_text = "NO ITEMS"
-            hint_text = ""
-    elif stage == 'order_summary':
-        stage_text = "ORDER SUMMARY"
-        main_text = f"{len(order_items)} item(s)"
-        hint_text = ""
-    elif stage == 'reorder_menu':
-        stage_text = "ORDER COMPLETE!"
-        main_text = REORDER_MENU[menu_idx]
-        hint_text = f"({menu_idx+1}/{len(REORDER_MENU)})"
-
-    # Build the cart list
-    cart_lines = []
-    if order_items:
-        for i, item in enumerate(order_items, 1):
-            cart_lines.append(f"{i}. {item}")
-    else:
-        cart_lines.append("Empty")
-
-    cart_html = "**Cart ({})**\n\n".format(len(order_items)) + "\n".join(cart_lines)
-
-#     legend_html = """
-# ---
-# **Gesture Legend**  
-# 👍 Next &nbsp;|&nbsp; 👎 Previous &nbsp;|&nbsp; ☝️ Accept &nbsp;|&nbsp; 🖐️ Back &nbsp;|&nbsp; ✊ Idle
-# """
-    # Full info HTML
-    info_html = f"""
-### {stage_text}
-**{main_text}**
-{f'*{hint_text}*' if hint_text else ''}
-
----
-
-{cart_html}
+        return "SELECT CATEGORY", cats[s.cat_idx], f"{s.cat_idx + 1}/{len(cats)}"
+    if stage == "selecting_item":
+        items = get_items(s.selected_category)
+        return (
+            f"SELECT ITEM · {s.selected_category}",
+            items[s.item_idx],
+            f"{s.item_idx + 1}/{len(items)}",
+        )
+    if stage == "remove_from_stack":
+        if s.order_items:
+            return "REMOVE ITEM", s.order_items[s.remove_idx], f"{s.remove_idx + 1}/{len(s.order_items)}"
+        return "REMOVE ITEM", "No items in cart", ""
+    if stage == "order_summary":
+        return "ORDER SUMMARY", f"{len(s.order_items)} item(s)", ""
+    if stage == "reorder_menu":
+        return "ORDER COMPLETE!", REORDER_MENU[s.menu_idx], f"{s.menu_idx + 1}/{len(REORDER_MENU)}"
+    return "", "", ""
 
 
+def available_actions():
+    """Which gestures make sense for the current stage (controls buttons)."""
+    stage = st.session_state.stage
+    if stage in ("main_menu",):
+        return ["Previous", "Next", "Accept"]
+    if stage in ("selecting_category", "selecting_item", "reorder_menu"):
+        return ["Previous", "Next", "Accept", "Back"]
+    if stage == "remove_from_stack":
+        if st.session_state.order_items:
+            return ["Previous", "Next", "Accept", "Back"]
+        return ["Back"]
+    if stage == "order_summary":
+        return ["Accept", "Back"]
+    return []
+
+
+# Friendlier verbs for the buttons depending on context
+def action_label(action):
+    stage = st.session_state.stage
+    verbs = {"Next": "Next", "Previous": "Previous", "Accept": "Select", "Back": "Back"}
+    if action == "Accept":
+        if stage in ("selecting_item",):
+            verbs["Accept"] = "Add to cart"
+        elif stage == "remove_from_stack":
+            verbs["Accept"] = "Remove"
+        elif stage == "order_summary":
+            verbs["Accept"] = "Confirm"
+    return f"{GESTURE_ICONS[action]} {verbs[action]}"
+
+
+# ============================================================
+#  Background camera worker (thread-safe gesture detection)
+# ============================================================
+@st.cache_resource
+def get_camera_worker():
+    """A single shared worker that owns the webcam and detects gestures.
+
+    Lives across reruns thanks to cache_resource. The main thread reads
+    `latest_frame` for display and pops `pending_gesture` to apply actions.
     """
 
-    # Update the placeholder **only if the content changed**
-    if info_html != last_info_html:
-        info_placeholder.markdown(info_html)
-        last_info_html = info_html
+    class CameraWorker:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.latest_frame = None
+            self.pending_gesture = None
+            self.last_detected = None
+            self.last_prediction = "—"   # raw label (incl. Idle / No hand) for display
+            self.running = False
+            self._thread = None
+            self._last_pred_time = 0.0
 
-    # Update camera feed (always)
-    frame_placeholder.image(rgb, channels="RGB", use_container_width=True)
+        def start(self):
+            # Guard against spawning a second reader (the root cause of the
+            # MSMF "can't grab frame" spam = two threads fighting the webcam).
+            with self.lock:
+                if self.running and self._thread is not None and self._thread.is_alive():
+                    return
+                self.running = True
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
 
-    # ---------- Gesture detection ----------
-    now = time.time()
-    if now - last_detection >= DETECTION_INTERVAL:
-        try:
-            landmarks = get_landmarks(rgb)
-            if landmarks:
-                flat = flatten_landmarks(landmarks[0])
-                gesture = predict_svc(flat)
-                if gesture != last_gesture:
-                    last_gesture = gesture
-                    process_gesture(gesture)
-        except Exception:
-            pass
-        last_detection = now
+        def stop(self):
+            self.running = False
 
-    time.sleep(0.03)
+        def _open(self):
+            # DirectShow is much quieter than MSMF on Windows.
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(0)  # fall back to default backend
+            return cap
 
-cap.release()
+        def _loop(self):
+            cap = self._open()
+            fail_count = 0
+            try:
+                while self.running:
+                    if not cap.isOpened():
+                        time.sleep(0.1)
+                        cap.release()
+                        cap = self._open()
+                        continue
+
+                    ret, frame = cap.read()
+                    if not ret:
+                        # Recover from transient grab failures instead of
+                        # hammering the device (which produces the warning flood).
+                        fail_count += 1
+                        if fail_count > 30:
+                            cap.release()
+                            cap = self._open()
+                            fail_count = 0
+                        time.sleep(0.05)
+                        continue
+                    fail_count = 0
+
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    with self.lock:
+                        self.latest_frame = rgb
+
+                    now = time.time()
+                    if now - self._last_pred_time >= DETECTION_INTERVAL:
+                        self._last_pred_time = now
+                        try:
+                            landmarks = get_landmarks(rgb)
+                            if landmarks:
+                                flat = flatten_landmarks(landmarks[0])
+                                gesture = predict_svc(flat)
+                                with self.lock:
+                                    self.last_prediction = gesture
+                                if gesture != "Idle" and gesture != self.last_detected:
+                                    with self.lock:
+                                        self.pending_gesture = gesture
+                                self.last_detected = gesture
+                            else:
+                                with self.lock:
+                                    self.last_prediction = "No hand"
+                                self.last_detected = None
+                        except Exception:
+                            pass
+                    time.sleep(0.03)
+            finally:
+                cap.release()
+                with self.lock:
+                    self.latest_frame = None
+
+        def read(self):
+            with self.lock:
+                return self.latest_frame
+
+        def pop_gesture(self):
+            with self.lock:
+                g = self.pending_gesture
+                self.pending_gesture = None
+                return g
+
+        def get_prediction(self):
+            with self.lock:
+                return self.last_prediction
+
+    return CameraWorker()
+
+
+worker = get_camera_worker()
+
+# ============================================================
+#  Sidebar — controls & legend
+# ============================================================
+with st.sidebar:
+    st.header("🎮 Controls")
+    st.session_state.camera_on = st.toggle("Enable camera & gestures", value=st.session_state.camera_on)
+    if st.session_state.camera_on:
+        worker.start()
+    else:
+        worker.stop()
+
+    st.divider()
+    st.subheader("Gesture Legend")
+    legend = " ".join(
+        f"<span class='gesture-badge'>{icon} {name}</span>"
+        for name, icon in GESTURE_ICONS.items()
+    )
+    st.markdown(legend, unsafe_allow_html=True)
+    st.caption("Use the buttons below the camera, or show the matching hand gesture.")
+
+# ============================================================
+#  Build the info panel as one HTML string (so it can be
+#  re-rendered in place without redrawing the whole page)
+# ============================================================
+def build_info_html():
+    title, main_text, hint = current_view()
+    s = st.session_state
+
+    if s.order_items:
+        cart_rows = "".join(
+            f"<div style='padding:2px 0'>{i}. {item}</div>"
+            for i, item in enumerate(s.order_items, 1)
+        )
+    else:
+        cart_rows = "<div style='color:#888'>Empty</div>"
+
+    status_html = (
+        f"<div style='background:#143d14;border:1px solid #2e7d2e;border-radius:8px;"
+        f"padding:6px 10px;margin:8px 0;font-size:14px'>✅ {s.last_status}</div>"
+        if s.last_status
+        else ""
+    )
+
+    return f"""
+    <div class="stage-card">
+        <div class="stage-title">{title}</div>
+        <div class="stage-main">{main_text}</div>
+        <div class="stage-hint">{hint}</div>
+    </div>
+    {status_html}
+    <div style='font-weight:700;font-size:16px;margin:6px 0'>🛒 Cart ({len(s.order_items)})</div>
+    {cart_rows}
+    """
+
+
+# ============================================================
+#  Main layout  (drawn once per rerun; the camera + info
+#  panel are then updated in place inside the loop below)
+# ============================================================
+st.title("🎮 Gesture Order System")
+
+left, right = st.columns([3, 2], gap="large")
+
+with left:
+    cam_box = st.empty()
+    pred_box = st.empty()
+    st.markdown("##### Controls")
+    controls_box = st.empty()
+
+with right:
+    info_box = st.empty()
+
+
+def render_prediction(label):
+    """Show the live predicted gesture under the camera."""
+    icon = GESTURE_ICONS.get(label, "🤚" if label == "No hand" else "")
+    color = "#888" if label in ("No hand", "Idle", "—") else "#9aff9a"
+    pred_box.markdown(
+        f"<div style='text-align:center;font-size:18px;margin:4px 0'>"
+        f"Predicted gesture: <b style='color:{color}'>{icon} {label}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_controls():
+    """Draw the action buttons for the current stage into controls_box.
+
+    Mouse clicks trigger Streamlit's normal rerun (instant). We redraw this
+    in place when a *gesture* changes the stage, so the video never freezes.
+    """
+    # Bump a counter so re-rendered buttons never collide on `key`
+    # (Streamlit keeps old keys registered within the same script run).
+    render_controls._n = getattr(render_controls, "_n", 0) + 1
+    n = render_controls._n
+
+    actions = available_actions()
+    with controls_box.container():
+        if actions:
+            cols = st.columns(len(actions))
+            for col, action in zip(cols, actions):
+                with col:
+                    if st.button(action_label(action), key=f"btn_{action}_{n}"):
+                        process_gesture(action)
+                        st.rerun()
+        else:
+            st.caption("No actions available.")
+
+
+# Initial render
+render_controls()
+info_box.markdown(build_info_html(), unsafe_allow_html=True)
+
+# ============================================================
+#  Live loop — updates camera, info AND buttons IN PLACE.
+#  No st.rerun() on gesture, so the video feed never freezes.
+# ============================================================
+if not st.session_state.camera_on:
+    cam_box.info("📷 Camera is off. Enable it in the sidebar to use gestures — or just use the buttons below.")
+else:
+    last_info = build_info_html()
+    last_stage = st.session_state.stage
+    last_pred = None
+    while st.session_state.camera_on:
+        frame = worker.read()
+        if frame is not None:
+            cam_box.image(frame, channels="RGB", use_container_width=True)
+        else:
+            cam_box.info("📷 Starting camera…")
+
+        # Show the live predicted gesture (update only when it changes)
+        pred = worker.get_prediction()
+        if pred != last_pred:
+            render_prediction(pred)
+            last_pred = pred
+
+        g = worker.pop_gesture()
+        if g and g in ("Next", "Previous", "Accept", "Back"):
+            process_gesture(g)
+            # If the stage changed, redraw the buttons IN PLACE (no rerun).
+            if st.session_state.stage != last_stage:
+                render_controls()
+                last_stage = st.session_state.stage
+
+        # Refresh info panel in place only if its content changed
+        new_info = build_info_html()
+        if new_info != last_info:
+            info_box.markdown(new_info, unsafe_allow_html=True)
+            last_info = new_info
+
+        time.sleep(0.03)

@@ -43,13 +43,33 @@ st.markdown(
             display:inline-block; padding:2px 10px; margin:2px;
             border-radius:20px; background:#262730; font-size:13px;
         }
+        /* The menu card sits in the centre of the D-pad cross. A glowing
+           border makes the correlation "this is what the buttons act on" obvious. */
         .stage-card {
-            background:#1e1e26; border:1px solid #333; border-radius:14px;
-            padding:14px 20px; text-align:center; margin-bottom:10px;
+            background:linear-gradient(160deg,#23232e,#1a1a22);
+            border:1px solid #3a3a52; border-radius:16px;
+            padding:18px 20px; text-align:center;
+            box-shadow:0 0 0 1px #2a2a3a, 0 8px 24px rgba(120,120,255,.12);
         }
         .stage-title { color:#9aa0ff; font-size:13px; letter-spacing:2px; }
-        .stage-main  { font-size:28px; font-weight:700; margin:4px 0; }
+        .stage-main  { font-size:30px; font-weight:800; margin:6px 0; line-height:1.15; }
         .stage-hint  { color:#888; font-size:14px; }
+        /* In the D-pad, the side (Prev/Next) buttons are tall so they hug the
+           full height of the menu card and read as "left / right". The keyed
+           containers below emit stable `st-key-…` classes we can target. */
+        div[class*="st-key-dpad-prev"] .stButton > button,
+        div[class*="st-key-dpad-next"] .stButton > button { height: 132px; }
+        /* Tall dashed placeholder for an unavailable side direction. */
+        div[class*="st-key-dpad-prev"] .dpad-ghost,
+        div[class*="st-key-dpad-next"] .dpad-ghost { height: 132px; }
+        /* Dim slots where a direction isn't available for this stage, so the
+           cross keeps its shape and the user learns which gestures do nothing. */
+        .dpad-ghost {
+            height:56px; border:1px dashed #333; border-radius:12px;
+            display:flex; align-items:center; justify-content:center;
+            color:#555; font-size:22px;
+        }
+        .dpad-ghost.tall { height:132px; }
         /* Keep the camera image from growing taller than the viewport */
         div[data-testid="stImage"] img { max-height: 62vh; object-fit: contain; }
     </style>
@@ -260,7 +280,7 @@ def available_actions():
 
 
 # Friendlier verbs for the buttons depending on context
-def action_label(action):
+def action_verb(action):
     stage = st.session_state.stage
     verbs = {"Next": "Next", "Previous": "Previous", "Accept": "Select", "Back": "Back"}
     if action == "Accept":
@@ -270,7 +290,11 @@ def action_label(action):
             verbs["Accept"] = "Remove"
         elif stage == "order_summary":
             verbs["Accept"] = "Confirm"
-    return f"{GESTURE_ICONS[action]} {verbs[action]}"
+    return verbs[action]
+
+
+def action_label(action):
+    return f"{GESTURE_ICONS[action]} {action_verb(action)}"
 
 
 # ============================================================
@@ -407,14 +431,32 @@ with st.sidebar:
         for name, icon in GESTURE_ICONS.items()
     )
     st.markdown(legend, unsafe_allow_html=True)
-    st.caption("Use the buttons below the camera, or show the matching hand gesture.")
+    st.caption(
+        "The menu sits inside a D-pad: 👍 **Next** is on its right, "
+        "👎 **Previous** on its left, 🖐️ **Back** on top, ☝️ **Select** below. "
+        "Click a button or show the matching hand gesture."
+    )
 
 # ============================================================
-#  Build the info panel as one HTML string (so it can be
-#  re-rendered in place without redrawing the whole page)
+#  Build the info panels as HTML strings (so they can be
+#  re-rendered in place without redrawing the whole page).
+#  The menu card sits in the centre of the D-pad cross; the
+#  status + cart render below the whole console.
 # ============================================================
-def build_info_html():
+def build_card_html():
+    """The menu card that lives in the centre of the D-pad cross."""
     title, main_text, hint = current_view()
+    return f"""
+    <div class="stage-card">
+        <div class="stage-title">{title}</div>
+        <div class="stage-main">{main_text}</div>
+        <div class="stage-hint">{hint}</div>
+    </div>
+    """
+
+
+def build_cart_html():
+    """Status banner + cart list, shown beneath the console."""
     s = st.session_state
 
     if s.order_items:
@@ -433,11 +475,6 @@ def build_info_html():
     )
 
     return f"""
-    <div class="stage-card">
-        <div class="stage-title">{title}</div>
-        <div class="stage-main">{main_text}</div>
-        <div class="stage-hint">{hint}</div>
-    </div>
     {status_html}
     <div style='font-weight:700;font-size:16px;margin:6px 0'>🛒 Cart ({len(s.order_items)})</div>
     {cart_rows}
@@ -455,11 +492,14 @@ left, right = st.columns([3, 2], gap="large")
 with left:
     cam_box = st.empty()
     pred_box = st.empty()
-    st.markdown("##### Controls")
-    controls_box = st.empty()
 
 with right:
-    info_box = st.empty()
+    # The whole D-pad console (Back on top, Prev | menu | Next in the middle,
+    # Select on the bottom) lives in one placeholder so it can be redrawn in
+    # place when a gesture changes the stage — without an st.rerun() that would
+    # freeze the video feed. The cart panel sits below it in its own placeholder.
+    console_box = st.empty()
+    cart_box = st.empty()
 
 
 def render_prediction(label):
@@ -473,43 +513,86 @@ def render_prediction(label):
     )
 
 
-def render_controls():
-    """Draw the action buttons for the current stage into controls_box.
+def _ghost(tall=False):
+    """An empty, dimmed slot for a direction that isn't usable on this stage,
+    so the cross keeps its shape and the user sees which gestures do nothing."""
+    cls = "dpad-ghost tall" if tall else "dpad-ghost"
+    st.markdown(f"<div class='{cls}'>·</div>", unsafe_allow_html=True)
 
-    Mouse clicks trigger Streamlit's normal rerun (instant). We redraw this
-    in place when a *gesture* changes the stage, so the video never freezes.
+
+def render_console():
+    """Draw the D-pad console: the menu card wrapped by directional buttons.
+
+        ┌──────────────────────────┐
+        │        🖐️  Back          │   (top)
+        │  👎  ┌────────────┐  👍   │
+        │ Prev │  MENU CARD │ Next  │   (middle)
+        │      └────────────┘       │
+        │        ☝️  Select         │   (bottom)
+        └──────────────────────────┘
+
+    Each gesture's button is placed on the side that matches the gesture's
+    direction so the user instantly correlates gesture → button → menu effect.
+    Mouse clicks rerun normally (instant); on a *gesture* we redraw this in
+    place so the video never freezes.
     """
     # Bump a counter so re-rendered buttons never collide on `key`
     # (Streamlit keeps old keys registered within the same script run).
-    render_controls._n = getattr(render_controls, "_n", 0) + 1
-    n = render_controls._n
-
+    render_console._n = getattr(render_console, "_n", 0) + 1
+    n = render_console._n
     actions = available_actions()
-    with controls_box.container():
-        if actions:
-            cols = st.columns(len(actions))
-            for col, action in zip(cols, actions):
-                with col:
-                    if st.button(action_label(action), key=f"btn_{action}_{n}"):
-                        process_gesture(action)
-                        st.rerun()
+
+    def slot(action, tall=False):
+        if action in actions:
+            if st.button(action_label(action), key=f"btn_{action}_{n}"):
+                process_gesture(action)
+                st.rerun()
         else:
-            st.caption("No actions available.")
+            _ghost(tall=tall)
+
+    with console_box.container():
+        # --- Top: Back ---
+        _, top_c, _ = st.columns([1, 4, 1])
+        with top_c:
+            slot("Back")
+
+        # --- Middle: Previous | menu card | Next ---
+        c_prev, c_card, c_next = st.columns([1, 4, 1], gap="small")
+        with c_prev:
+            # Keyed container -> `st-key-dpad-prev` class -> tall-button CSS.
+            with st.container(key=f"dpad-prev-{n}"):
+                slot("Previous", tall=True)
+        with c_card:
+            st.markdown(build_card_html(), unsafe_allow_html=True)
+        with c_next:
+            with st.container(key=f"dpad-next-{n}"):
+                slot("Next", tall=True)
+
+        # --- Bottom: Select / Accept ---
+        _, bot_c, _ = st.columns([1, 4, 1])
+        with bot_c:
+            slot("Accept")
+
+
+def console_state():
+    """Everything that affects which buttons exist + the menu card content.
+    Used to decide when the in-place console needs a redraw."""
+    return (st.session_state.stage, build_card_html())
 
 
 # Initial render
-render_controls()
-info_box.markdown(build_info_html(), unsafe_allow_html=True)
+render_console()
+cart_box.markdown(build_cart_html(), unsafe_allow_html=True)
 
 # ============================================================
-#  Live loop — updates camera, info AND buttons IN PLACE.
+#  Live loop — updates camera AND the D-pad console IN PLACE.
 #  No st.rerun() on gesture, so the video feed never freezes.
 # ============================================================
 if not st.session_state.camera_on:
-    cam_box.info("📷 Camera is off. Enable it in the sidebar to use gestures — or just use the buttons below.")
+    cam_box.info("📷 Camera is off. Enable it in the sidebar to use gestures — or just use the buttons around the menu.")
 else:
-    last_info = build_info_html()
-    last_stage = st.session_state.stage
+    last_console = console_state()
+    last_cart = build_cart_html()
     last_pred = None
     while st.session_state.camera_on:
         frame = worker.read()
@@ -527,15 +610,19 @@ else:
         g = worker.pop_gesture()
         if g and g in ("Next", "Previous", "Accept", "Back"):
             process_gesture(g)
-            # If the stage changed, redraw the buttons IN PLACE (no rerun).
-            if st.session_state.stage != last_stage:
-                render_controls()
-                last_stage = st.session_state.stage
 
-        # Refresh info panel in place only if its content changed
-        new_info = build_info_html()
-        if new_info != last_info:
-            info_box.markdown(new_info, unsafe_allow_html=True)
-            last_info = new_info
+        # Redraw the whole console in place when either the stage (which
+        # buttons exist) or the card content changes. One placeholder keeps
+        # the buttons glued to the menu they act on.
+        new_console = console_state()
+        if new_console != last_console:
+            render_console()
+            last_console = new_console
+
+        # Refresh the cart/status panel in place only if it changed.
+        new_cart = build_cart_html()
+        if new_cart != last_cart:
+            cart_box.markdown(new_cart, unsafe_allow_html=True)
+            last_cart = new_cart
 
         time.sleep(0.03)
